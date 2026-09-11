@@ -24,14 +24,17 @@ Make a desktop shortcut to the `.bat` if you want it one click away.
 | **Start / Stop recording** | Toggles. The window minimises itself while recording (switch it off to keep the window on top instead). |
 | **Ctrl+Shift+F9** | Global hotkey -- starts / stops from anywhere, no need to find the window. |
 | Capture | `Full desktop`, or one monitor when more than one is attached. |
-| Audio input | `No audio` or any DirectShow input device. `↻` re-scans after plugging in a mic. |
+| **Record audio** tick | Off = video only. On = the audio controls light up. |
+| Audio input | Any DirectShow input device (mic, USB audio, Stereo Mix). `↻` re-scans after plugging in a mic. |
+| **Test mic** | Live level meter for the chosen device -- speak and watch the bar (green / amber / red near clipping). Click again to stop; it stops by itself when a recording starts. |
+| Audio quality | `Standard` = AAC 160 kb/s, 44.1 kHz. `High` = AAC 320 kb/s, 48 kHz. |
 | Frame rate | 15 / 24 / 30 / 60. 30 is the sensible default. |
 | Quality | `Small file` (crf 28), `Balanced` (crf 23), `High` (crf 18, bigger file). |
 | Save to | Folder for the clips. Default `%USERPROFILE%\Videos\sbmlabs_screen_recorder`. |
 | Open folder / Play last | Opens the folder in Explorer / plays the clip you just made. |
 
-Files are named `sbmlabs_rec_YYYYMMDD_HHMMSS.mp4`. FPS, quality, folder, audio
-device and the minimise choice are remembered in
+Files are named `sbmlabs_rec_YYYYMMDD_HHMMSS.mp4`. FPS, quality, folder, the audio
+tick, device, audio quality and the minimise choice are remembered in
 `%LOCALAPPDATA%\sbmlabs_screen_recorder\settings.json`.
 
 ## CLI
@@ -41,6 +44,7 @@ python recorder.py --list-audio                             # show input devices
 python recorder.py --cli                                    # video only, until Enter / Ctrl+C
 python recorder.py --cli --audio default                    # + first microphone found
 python recorder.py --cli --audio "USB PnP" --duration 60    # device by (part of) its name, 60 s
+python recorder.py --cli --audio default --audio-quality High   # AAC 320k / 48 kHz
 python recorder.py --cli --fps 60 --quality High --out D:\clips
 python recorder.py --cli --monitor 1                        # 0 = full desktop, 1.. = that monitor
 ```
@@ -48,8 +52,8 @@ python recorder.py --cli --monitor 1                        # 0 = full desktop, 
 ## How it records
 
 * **ffmpeg** (on PATH -- the winget `Gyan.FFmpeg` build is): `gdigrab` grabs the
-  desktop with the mouse cursor, `dshow` grabs the audio device, `libx264` +
-  `aac` (160 kb/s) encode live into one MP4. Stopping sends `q` to ffmpeg so the
+  desktop with the mouse cursor, `dshow` grabs the audio device (50 ms buffer
+  to keep it tight against the video), `libx264` + `aac` encode live into one MP4. Stopping sends `q` to ffmpeg so the
   file is finalised properly (`+faststart`, plays anywhere). Roughly 10-15 MB per
   minute at 1080p / 30 fps / Balanced, mostly depending on how much moves on
   screen.
