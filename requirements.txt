@@ -1,0 +1,6 @@
+customtkinter>=5.2
+
+# only needed for the no-ffmpeg fallback engine:
+# pillow
+# opencv-python
+# numpy
