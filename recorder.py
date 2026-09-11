@@ -1,18 +1,20 @@
-"""SBM Labs Screen Recorder -- records the Windows desktop (and a microphone) to MP4.
+"""SBM Labs Screen Recorder -- desktop, webcam and microphone to MP4.
 
-Desktop video plus optional audio from any input device Windows exposes
-(microphone, USB audio, Stereo Mix ...).  Whole desktop or one monitor.
+Any combination of three sources, each an optional tick:
+  * Desktop  -- whole virtual screen or one monitor, with the mouse cursor
+  * Camera   -- any DirectShow webcam; drawn top-right over the desktop as a
+                small picture-in-picture, or full-frame when the desktop is off
+  * Audio    -- any DirectShow input (mic, USB audio, Stereo Mix) with boost
 
-    python recorder.py                         # GUI (Start / Stop, Ctrl+Shift+F9 hotkey)
-    python recorder.py --cli                   # record until Enter / Ctrl+C
-    python recorder.py --cli --audio default   # with the first microphone found
-    python recorder.py --list-audio            # show input devices
+    python recorder.py                                  # GUI (Ctrl+Shift+F9 starts / stops)
+    python recorder.py --cli --audio default            # desktop + mic until Enter / Ctrl+C
+    python recorder.py --cli --camera default           # desktop + webcam PiP
+    python recorder.py --cli --no-desktop --camera default --audio default   # webcam only
+    python recorder.py --list-devices
 
-Engine: ffmpeg (gdigrab video + dshow audio -> libx264 / aac MP4) when it is
-on PATH; it draws the mouse cursor and encodes in real time.  Without ffmpeg
-it falls back to Pillow ImageGrab + OpenCV VideoWriter (video only, no cursor).
-
-GUI needs `customtkinter` (pip install customtkinter); the CLI does not.
+Engine: ffmpeg (gdigrab + dshow -> libx264 / aac) when it is on PATH.  Without
+ffmpeg a Pillow + OpenCV fallback records the desktop only (no cursor, no audio,
+no camera).  GUI needs `customtkinter`; the CLI does not.
 """
 from __future__ import annotations
 
@@ -51,7 +53,10 @@ AUDIO_PRESETS = {
 AUDIO_BUFFER_MS = 50   # dshow capture buffer; small keeps audio tight against the video
 MIC_GAIN_MAX = 30       # dB
 MIC_GAIN_DEFAULT = 20   # dB -- typical USB mics on Windows come in 15-25 dB too quiet
-NO_AUDIO = "No audio"
+# camera picture-in-picture width as a fraction of the desktop frame width
+CAMERA_SIZES = {"Small": 0.16, "Medium": 0.22, "Large": 0.30}
+PIP_MARGIN = 16         # px from the top-right corner
+PIP_BORDER = 3          # px white frame around the camera picture
 
 HOTKEY_ID = 1
 HOTKEY_LABEL = "Ctrl+Shift+F9"
@@ -105,26 +110,27 @@ def capture_targets() -> list[tuple[str, Region | None]]:
     return targets
 
 
-def new_output_path(out_dir: Path) -> Path:
+def new_output_path(out_dir: Path, ext: str = ".mp4") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / f"sbmlabs_rec_{datetime.now():%Y%m%d_%H%M%S}.mp4"
+    return out_dir / f"sbmlabs_rec_{datetime.now():%Y%m%d_%H%M%S}{ext}"
 
 
-# ---------------------------------------------------------------- audio -----
+# ---------------------------------------------------------------- devices ---
 @dataclass
-class AudioDevice:
+class DshowDevice:
     name: str          # friendly name shown to the user
-    alt: str = ""      # DirectShow "@device_cm_{...}" id, stable even with duplicate names
+    kind: str          # "audio" or "video"
+    alt: str = ""      # DirectShow "@device_..." id, stable even with duplicate names
 
     @property
     def dshow_input(self) -> str:
-        return f"audio={self.alt or self.name}"
+        return f"{self.kind}={self.alt or self.name}"
 
 
-def list_audio_devices(ffmpeg: str | None) -> list[AudioDevice]:
-    """DirectShow audio inputs as ffmpeg reports them (microphones, Stereo Mix, ...)."""
+def list_dshow_devices(ffmpeg: str | None) -> tuple[list[DshowDevice], list[DshowDevice]]:
+    """(audio inputs, cameras) as ffmpeg reports them."""
     if not ffmpeg:
-        return []
+        return [], []
     try:
         out = subprocess.run(
             [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
@@ -132,9 +138,10 @@ def list_audio_devices(ffmpeg: str | None) -> list[AudioDevice]:
             timeout=15, creationflags=NO_WINDOW,
         ).stderr
     except Exception:
-        return []
-    devices: list[AudioDevice] = []
-    current: AudioDevice | None = None
+        return [], []
+    audio: list[DshowDevice] = []
+    video: list[DshowDevice] = []
+    current: DshowDevice | None = None
     section = ""
     for line in out.splitlines():
         if "DirectShow audio devices" in line:      # older ffmpeg: section headers
@@ -155,17 +162,35 @@ def list_audio_devices(ffmpeg: str | None) -> list[AudioDevice]:
         else:
             m = re.search(r'\]\s+"(.+)"\s*$', line)                     # older ffmpeg: name only
             kind = section
-        if m:
-            current = AudioDevice(m.group(1)) if kind == "audio" else None
-            if current:
-                devices.append(current)
-    return devices
+        if not m:
+            continue
+        # "(none)" is a video-category device with no usable pins (e.g. OBS Virtual
+        # Camera while OBS is closed) -- it cannot be opened, so leave it out
+        current = DshowDevice(m.group(1), kind) if kind in ("audio", "video") else None
+        if current:
+            (audio if kind == "audio" else video).append(current)
+    return audio, video
+
+
+def find_device(devices: list[DshowDevice], wanted: str | None) -> DshowDevice | None:
+    """'default' -> first device; otherwise exact, then case-insensitive substring match on the name."""
+    if not wanted or not devices:
+        return None
+    if wanted.lower() == "default":
+        return devices[0]
+    for d in devices:
+        if d.name == wanted:
+            return d
+    for d in devices:
+        if wanted.lower() in d.name.lower():
+            return d
+    return None
 
 
 @dataclass
 class AudioSettings:
     """Everything the audio path needs: which device, how loud, how to encode."""
-    device: AudioDevice
+    device: DshowDevice
     quality: str = "Standard"
     gain_db: float = MIC_GAIN_DEFAULT
     auto_level: bool = True
@@ -191,64 +216,113 @@ class AudioSettings:
         return f"+{self.gain_db:.0f} dB{' auto' if self.auto_level else ''}{', HQ' if self.quality == 'High' else ''}"
 
 
-def find_audio_device(devices: list[AudioDevice], wanted: str | None) -> AudioDevice | None:
-    """'default' -> first device; otherwise exact, then case-insensitive substring match on the name."""
-    if not wanted or wanted == NO_AUDIO or not devices:
-        return None
-    if wanted.lower() == "default":
-        return devices[0]
-    for d in devices:
-        if d.name == wanted:
-            return d
-    for d in devices:
-        if wanted.lower() in d.name.lower():
-            return d
-    return None
+@dataclass
+class CameraSettings:
+    device: DshowDevice
+    size: str = "Small"     # key of CAMERA_SIZES; only matters when drawn over the desktop
+
+    @property
+    def fraction(self) -> float:
+        return CAMERA_SIZES.get(self.size, CAMERA_SIZES["Small"])
+
+
+@dataclass
+class RecordJob:
+    path: Path
+    fps: int = 30
+    quality: str = "Balanced"
+    desktop: bool = True
+    region: Region | None = None       # None = whole virtual desktop
+    camera: CameraSettings | None = None
+    audio: AudioSettings | None = None
+
+    @property
+    def has_video(self) -> bool:
+        return self.desktop or self.camera is not None
+
+    @property
+    def desktop_width(self) -> int:
+        return (self.region or virtual_desktop())[2]
+
+    def describe(self) -> str:
+        parts = []
+        if self.desktop:
+            parts.append("desktop")
+        if self.camera:
+            parts.append(f"camera {self.camera.device.name}" + (f" ({self.camera.size} PiP)" if self.desktop else ""))
+        if self.audio:
+            parts.append(f"audio {self.audio.device.name} ({self.audio.label})")
+        return " + ".join(parts) or "nothing"
 
 
 # ---------------------------------------------------------------- engines ---
 class FfmpegRecorder:
-    """gdigrab (+ dshow audio) -> libx264 / aac.  Stopped by sending 'q' so the MP4 is finalised."""
+    """gdigrab desktop + dshow camera / mic -> libx264 / aac.  Stopped by sending 'q'
+    so the MP4 is finalised."""
 
-    name = "ffmpeg (gdigrab + libx264 / aac)"
-    supports_audio = True
+    name = "ffmpeg (gdigrab + dshow -> libx264 / aac)"
+    supports_devices = True
 
     def __init__(self, ffmpeg: str) -> None:
         self.ffmpeg = ffmpeg
         self.proc: subprocess.Popen | None = None
         self.path: Path | None = None
 
-    def start(self, path: Path, fps: int, quality: str, region: Region | None,
-              audio: AudioSettings | None = None) -> None:
-        crf, preset = QUALITY_PRESETS[quality]
+    def build_command(self, job: RecordJob) -> list[str]:
+        crf, preset = QUALITY_PRESETS[job.quality]
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-        if audio is not None:
-            cmd += ["-f", "dshow", "-audio_buffer_size", str(AUDIO_BUFFER_MS),
-                    "-thread_queue_size", "1024", "-rtbufsize", "64M", "-i", audio.device.dshow_input]
-        cmd += ["-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1",
-                "-rtbufsize", "256M", "-thread_queue_size", "512"]
-        if region is not None:
-            x, y, w, h = region
-            cmd += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w}x{h}"]
-        cmd += ["-i", "desktop"]
-        if audio is not None:
-            bitrate, sample_rate = AUDIO_PRESETS[audio.quality]
-            cmd += ["-map", "1:v:0", "-map", "0:a:0",
-                    "-c:a", "aac", "-b:a", bitrate, "-ar", str(sample_rate),
-                    "-af", f"aresample=async=1,{audio.filter}"]
-        cmd += [
-            # yuv420p needs even dimensions; odd desktop sizes get cropped by 1px
-            "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", str(path),
-        ]
-        self.path = path
+        idx: dict[str, int] = {}          # input kind -> ffmpeg input index
+
+        def add_input(kind: str, args: list[str]) -> None:
+            idx[kind] = len(idx)
+            cmd.extend(args)
+
+        if job.audio:
+            add_input("a", ["-f", "dshow", "-audio_buffer_size", str(AUDIO_BUFFER_MS),
+                            "-thread_queue_size", "1024", "-rtbufsize", "64M", "-i", job.audio.device.dshow_input])
+        if job.desktop:
+            args = ["-f", "gdigrab", "-framerate", str(job.fps), "-draw_mouse", "1",
+                    "-rtbufsize", "256M", "-thread_queue_size", "512"]
+            if job.region is not None:
+                x, y, w, h = job.region
+                args += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w}x{h}"]
+            add_input("d", args + ["-i", "desktop"])
+        if job.camera:
+            add_input("c", ["-f", "dshow", "-rtbufsize", "100M", "-thread_queue_size", "512",
+                            "-i", job.camera.device.dshow_input])
+
+        even = "crop=trunc(iw/2)*2:trunc(ih/2)*2"   # yuv420p needs even dimensions
+        if "d" in idx and "c" in idx:
+            # camera scaled to a fraction of the desktop width, white frame, top-right corner
+            cam_w = max(2, round(job.desktop_width * job.camera.fraction / 2) * 2)
+            b, m = PIP_BORDER, PIP_MARGIN
+            graph = (f"[{idx['d']}:v]{even}[desk];"
+                     f"[{idx['c']}:v]scale={cam_w}:-2,pad=iw+{2 * b}:ih+{2 * b}:{b}:{b}:color=white[cam];"
+                     f"[desk][cam]overlay=x=W-w-{m}:y={m}:eof_action=pass[v]")
+            cmd += ["-filter_complex", graph, "-map", "[v]"]
+        elif "d" in idx:
+            cmd += ["-map", f"{idx['d']}:v:0", "-vf", even]
+        elif "c" in idx:
+            cmd += ["-map", f"{idx['c']}:v:0", "-vf", even, "-r", str(job.fps)]
+        if job.audio:
+            bitrate, sample_rate = AUDIO_PRESETS[job.audio.quality]
+            cmd += ["-map", f"{idx['a']}:a:0", "-c:a", "aac", "-b:a", bitrate, "-ar", str(sample_rate),
+                    "-af", f"aresample=async=1,{job.audio.filter}"]
+        if job.has_video:
+            cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        cmd += ["-movflags", "+faststart", str(job.path)]
+        return cmd
+
+    def start(self, job: RecordJob) -> None:
+        if not job.has_video and job.audio is None:
+            raise RuntimeError("Nothing to record: tick at least one of desktop, camera or audio.")
+        self.path = job.path
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            self.build_command(job), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             creationflags=NO_WINDOW,
         )
-        # ffmpeg exits within a second if the args / devices are wrong; catch that early
-        time.sleep(1.0)
+        # ffmpeg exits within a second or two if the args / devices are wrong; catch that early
+        time.sleep(1.5 if job.camera else 1.0)
         if self.proc.poll() is not None:
             err = self.proc.stderr.read().decode(errors="replace").strip() if self.proc.stderr else ""
             self.proc = None
@@ -281,10 +355,10 @@ class FfmpegRecorder:
 
 
 class PillowRecorder:
-    """Fallback: ImageGrab frames written by OpenCV at a real-time paced fps.  Video only."""
+    """Fallback: ImageGrab frames written by OpenCV at a real-time paced fps.  Desktop only."""
 
-    name = "Pillow ImageGrab + OpenCV (no cursor, no audio)"
-    supports_audio = False
+    name = "Pillow ImageGrab + OpenCV (desktop only, no cursor)"
+    supports_devices = False
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
@@ -292,15 +366,16 @@ class PillowRecorder:
         self._error: Exception | None = None
         self.path: Path | None = None
 
-    def start(self, path: Path, fps: int, quality: str, region: Region | None,
-              audio: AudioSettings | None = None) -> None:
+    def start(self, job: RecordJob) -> None:
         import cv2  # noqa: F401  -- fail here, not inside the thread
         from PIL import ImageGrab  # noqa: F401
 
-        self.path = path
+        if not job.desktop:
+            raise RuntimeError("Camera and audio need ffmpeg on PATH (winget install Gyan.FFmpeg).")
+        self.path = job.path
         self._stop.clear()
         self._error = None
-        self._thread = threading.Thread(target=self._run, args=(path, fps, region), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(job.path, job.fps, job.region), daemon=True)
         self._thread.start()
         time.sleep(0.5)
         if self._error:
@@ -357,8 +432,9 @@ def pick_engine():
 
 
 class MicMeter:
-    """Live input level for the mic test: ffmpeg listens to the device and prints
-    the peak level of every ~46 ms block; we parse those lines as they arrive."""
+    """Live input level for the mic test: ffmpeg listens to the device (through the
+    same boost chain as a recording) and prints the peak level of every ~46 ms
+    block; we parse those lines as they arrive."""
 
     SILENCE_DB = -60.0
 
@@ -412,6 +488,42 @@ class MicMeter:
         return max(0.0, min(1.0, (self.level_db - self.SILENCE_DB) / -self.SILENCE_DB))
 
 
+class CameraPreview:
+    """A small always-on-top ffplay window showing the chosen camera.  DirectShow
+    cameras cannot be opened twice, so this is closed before a recording starts."""
+
+    def __init__(self, ffmpeg: str, device: DshowDevice) -> None:
+        self.ffplay = shutil.which("ffplay") or str(Path(ffmpeg).with_name("ffplay.exe"))
+        self.device = device
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if not Path(self.ffplay).exists():
+            raise RuntimeError("ffplay.exe (ships with ffmpeg) was not found next to ffmpeg.")
+        self.proc = subprocess.Popen(
+            [self.ffplay, "-hide_banner", "-loglevel", "error", "-window_title", f"{APP_NAME} - camera preview",
+             "-alwaysontop", "-x", "480", "-f", "dshow", "-i", self.device.dshow_input],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
+        )
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def error(self) -> str:
+        if self.proc is None or self.proc.poll() is None:
+            return ""
+        return self.proc.stderr.read().decode(errors="replace").strip() if self.proc.stderr else ""
+
+    def stop(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 # ---------------------------------------------------------------- settings --
 def load_settings() -> dict:
     try:
@@ -457,6 +569,7 @@ TEXT, MUTED, DIM = "#e9ecf3", "#8a93a8", "#5c6578"
 RED, RED_HOVER, RED_DIM, GREEN, AMBER = "#e53935", "#c62828", "#7a2b2b", "#43a047", "#f9a825"
 START_DELAY_MS = 450   # let the window finish minimising before the first frame
 DETECTING = "Detecting…"
+NONE_FOUND = "None found"
 
 
 class RecorderApp:
@@ -467,34 +580,46 @@ class RecorderApp:
         ctk.set_appearance_mode("dark")
         self.engine = pick_engine()
         self.ffmpeg = getattr(self.engine, "ffmpeg", None)
+        self.devices_ok = self.engine.supports_devices
         self.targets = capture_targets()
-        self.audio_devices: list[AudioDevice] = []
+        self.audio_devices: list[DshowDevice] = []
+        self.cameras: list[DshowDevice] = []
         self.events: queue.Queue[str] = queue.Queue()
         self.recording = False
         self.busy = False
         self.started_at = 0.0
         self.last_file: Path | None = None
         self.blink = False
+        self.ticks = 0
+        self.meter: MicMeter | None = None
+        self.preview: CameraPreview | None = None
 
         s = load_settings()
         self.root = ctk.CTk(fg_color=BG)
         self.root.title(APP_NAME)
-        self.root.geometry("460x836")
+        self.root.geometry("820x640")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.v_target = ctk.StringVar(value=self.targets[0][0])
-        self.v_audio = ctk.StringVar(value=DETECTING if self.engine.supports_audio else "Needs ffmpeg")
+        unavailable = DETECTING if self.devices_ok else "Needs ffmpeg"
+        self.v_desktop_on = ctk.BooleanVar(value=bool(s.get("desktop_on", True)))
+        self.v_target = ctk.StringVar(value=s.get("target", self.targets[0][0]))
+        if self.v_target.get() not in dict(self.targets):
+            self.v_target.set(self.targets[0][0])
+        self.v_camera_on = ctk.BooleanVar(value=self.devices_ok and bool(s.get("camera_on", False)))
+        self.v_camera = ctk.StringVar(value=unavailable)
+        self.v_camera_size = ctk.StringVar(value=s.get("camera_size", "Small"))
+        self.wanted_camera = s.get("camera", "default")
         # older settings stored "No audio" as the device name; treat that as the tick being off
-        self.v_audio_on = ctk.BooleanVar(value=self.engine.supports_audio
-                                         and bool(s.get("audio_on", s.get("audio") != NO_AUDIO)))
+        self.v_audio_on = ctk.BooleanVar(value=self.devices_ok and bool(s.get("audio_on", s.get("audio") != "No audio")))
+        self.v_audio = ctk.StringVar(value=unavailable)
         self.v_audio_quality = ctk.StringVar(value=s.get("audio_quality", "Standard"))
         self.v_gain = ctk.DoubleVar(value=max(0.0, min(float(MIC_GAIN_MAX), float(s.get("mic_gain", MIC_GAIN_DEFAULT)))))
         self.v_gain_text = ctk.StringVar(value="")
         self.v_auto_level = ctk.BooleanVar(value=bool(s.get("auto_level", True)))
         self.v_level = ctk.StringVar(value="")
-        self.meter: MicMeter | None = None
+        self.wanted_audio = s.get("audio", "default")
         self.v_fps = ctk.StringVar(value=str(s.get("fps", 30)))
         self.v_quality = ctk.StringVar(value=s.get("quality", "Balanced"))
         self.v_out = ctk.StringVar(value=s.get("out_dir", str(DEFAULT_OUT_DIR)))
@@ -503,206 +628,264 @@ class RecorderApp:
         self.v_summary = ctk.StringVar(value="")
         self.v_clock = ctk.StringVar(value="00:00:00")
         self.v_last = ctk.StringVar(value="No recording yet")
-        self.wanted_audio = s.get("audio", "default")
 
         self._build()
         hot = start_hotkey_listener(lambda: self.events.put("toggle"))
-        self.l_hotkey.configure(text=f"{HOTKEY_LABEL}  starts / stops" if hot
-                                else f"{HOTKEY_LABEL} is taken by another app")
-        for v in (self.v_target, self.v_audio, self.v_audio_on, self.v_audio_quality, self.v_gain, self.v_auto_level,
+        self.l_hotkey.configure(text=f"Hotkey  {HOTKEY_LABEL}" if hot else "Hotkey taken by another app")
+        for v in (self.v_desktop_on, self.v_target, self.v_camera_on, self.v_camera, self.v_camera_size,
+                  self.v_audio_on, self.v_audio, self.v_audio_quality, self.v_gain, self.v_auto_level,
                   self.v_fps, self.v_quality):
             v.trace_add("write", lambda *_: self._refresh_summary())
         self._refresh_summary()
-        if self.engine.supports_audio:
-            threading.Thread(target=self._detect_audio, daemon=True).start()
+        if self.devices_ok:
+            threading.Thread(target=self._detect_devices, daemon=True).start()
         self.root.after(100, self._poll)
 
     # -- layout ---------------------------------------------------------
     def _font(self, size: int, weight: str = "normal", family: str = "Segoe UI"):
         return self.ctk.CTkFont(family=family, size=size, weight=weight)
 
-    def _section(self, parent, text: str, row: int, column: int = 0, columnspan: int = 3, pady=(14, 4)):
+    def _label(self, parent, text: str, **grid):
         self.ctk.CTkLabel(parent, text=text.upper(), font=self._font(11, "bold"), text_color=MUTED,
-                          anchor="w").grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=pady)
+                          anchor="w").grid(sticky="w", **grid)
+
+    def _tick(self, parent, text: str, var, command):
+        return self.ctk.CTkCheckBox(parent, text=text.upper(), variable=var, command=command,
+                                    font=self._font(11, "bold"), text_color=MUTED, checkbox_width=18,
+                                    checkbox_height=18, corner_radius=5, border_width=2, border_color=DIM,
+                                    fg_color=RED, hover_color=RED_HOVER)
+
+    def _card(self, parent, title: str, **grid):
+        ctk = self.ctk
+        outer = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
+        outer.grid(**grid)
+        inner = ctk.CTkFrame(outer, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=16, pady=(12, 16))
+        inner.columnconfigure(0, weight=1)
+        ctk.CTkLabel(inner, text=title.upper(), font=self._font(10, "bold"), text_color=DIM, anchor="w").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        return inner
 
     def _build(self) -> None:
         ctk = self.ctk
+        self.menu_kw = dict(height=34, corner_radius=10, fg_color=CARD_2, button_color=LINE, button_hover_color=DIM,
+                            dropdown_fg_color=CARD_2, dropdown_hover_color=LINE, text_color=TEXT,
+                            font=self._font(13), dropdown_font=self._font(13), dynamic_resizing=False, anchor="w")
+        self.seg_kw = dict(height=32, corner_radius=10, fg_color=CARD_2, unselected_color=CARD_2,
+                           unselected_hover_color=LINE, selected_color=RED, selected_hover_color=RED_HOVER,
+                           text_color=TEXT, font=self._font(12))
+        self.small_kw = dict(height=26, corner_radius=8, fg_color=CARD_2, hover_color=LINE, text_color=MUTED,
+                             font=self._font(12))
+
         f = ctk.CTkFrame(self.root, fg_color="transparent")
-        f.pack(fill="both", expand=True, padx=22, pady=(18, 16))
-        f.columnconfigure(0, weight=1)
+        f.pack(fill="both", expand=True, padx=20, pady=(14, 14))
+        f.columnconfigure(0, weight=1, uniform="col")
+        f.columnconfigure(1, weight=1, uniform="col")
 
         # header
         ctk.CTkLabel(f, text="S B M   L A B S", font=self._font(11, "bold"), text_color=RED, anchor="w").grid(
             row=0, column=0, sticky="w")
         ctk.CTkLabel(f, text="Screen Recorder", font=self._font(24, "bold"), text_color=TEXT, anchor="w").grid(
-            row=1, column=0, sticky="w", pady=(0, 12))
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # status card
+        # status card across both columns
         card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=16, border_width=1, border_color=LINE)
-        card.grid(row=2, column=0, sticky="we")
+        card.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
         card.columnconfigure(1, weight=1)
         self.l_dot = ctk.CTkLabel(card, text="●", font=self._font(22), text_color=DIM, width=24)
-        self.l_dot.grid(row=0, column=0, padx=(16, 8), pady=(14, 0), sticky="w")
+        self.l_dot.grid(row=0, column=0, padx=(16, 8), pady=(12, 0), sticky="w")
         ctk.CTkLabel(card, textvariable=self.v_status, font=self._font(17, "bold"), text_color=TEXT, anchor="w").grid(
-            row=0, column=1, sticky="w", pady=(14, 0))
+            row=0, column=1, sticky="w", pady=(12, 0))
         ctk.CTkLabel(card, textvariable=self.v_clock, font=self._font(22, "bold", "Consolas"), text_color=TEXT).grid(
-            row=0, column=2, padx=16, pady=(14, 0), sticky="e")
+            row=0, column=2, padx=16, pady=(12, 0), sticky="e")
         ctk.CTkLabel(card, textvariable=self.v_summary, font=self._font(12), text_color=MUTED, anchor="w",
-                     wraplength=380, justify="left").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 14))
+                     wraplength=740, justify="left").grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 12))
 
-        # settings
-        body = ctk.CTkFrame(f, fg_color="transparent")
-        body.grid(row=3, column=0, sticky="we")
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
-        menu_kw = dict(height=36, corner_radius=10, fg_color=CARD_2, button_color=LINE, button_hover_color=DIM,
-                       dropdown_fg_color=CARD_2, dropdown_hover_color=LINE, text_color=TEXT,
-                       font=self._font(13), dropdown_font=self._font(13), dynamic_resizing=False, anchor="w")
+        self._build_sources(self._card(f, "Sources", row=3, column=0, sticky="nsew", padx=(0, 6)))
+        self._build_output(self._card(f, "Output", row=3, column=1, sticky="nsew", padx=(6, 0)))
 
-        self._section(body, "Capture", 0, pady=(10, 4))
-        self.m_target = ctk.CTkOptionMenu(body, values=[t[0] for t in self.targets], variable=self.v_target, **menu_kw)
-        self.m_target.grid(row=1, column=0, columnspan=3, sticky="we")
+    def _build_sources(self, p) -> None:
+        ctk = self.ctk
+        p.columnconfigure(1, weight=1)
+        dev_state = "normal" if self.devices_ok else "disabled"
 
-        # the section label is itself the tick box: audio is optional
-        self.k_audio = ctk.CTkCheckBox(body, text="RECORD AUDIO", variable=self.v_audio_on, command=self._audio_toggled,
-                                       font=self._font(11, "bold"), text_color=MUTED, checkbox_width=18,
-                                       checkbox_height=18, corner_radius=5, border_width=2, border_color=DIM,
-                                       fg_color=RED, hover_color=RED_HOVER,
-                                       state="normal" if self.engine.supports_audio else "disabled")
-        self.k_audio.grid(row=2, column=0, sticky="w", pady=(14, 4))
-        small_kw = dict(height=26, corner_radius=8, fg_color=CARD_2, hover_color=LINE, text_color=MUTED)
-        self.b_test = ctk.CTkButton(body, text="Test mic", width=74, font=self._font(12), command=self.test_mic,
-                                    state="disabled", **small_kw)
-        self.b_test.grid(row=2, column=1, sticky="e", padx=(0, 6), pady=(14, 4))
-        self.b_refresh = ctk.CTkButton(body, text="↻", width=32, font=self._font(14), command=self.refresh_audio,
-                                       state="normal" if self.engine.supports_audio else "disabled", **small_kw)
-        self.b_refresh.grid(row=2, column=2, sticky="e", pady=(14, 4))
-        self.m_audio = ctk.CTkOptionMenu(body, values=[self.v_audio.get()], variable=self.v_audio,
-                                         command=lambda _v: self._audio_changed(), **menu_kw)
-        self.m_audio.grid(row=3, column=0, columnspan=3, sticky="we")
+        # desktop
+        self.k_desktop = self._tick(p, "Record desktop", self.v_desktop_on, self._sources_toggled)
+        self.k_desktop.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        self.m_target = ctk.CTkOptionMenu(p, values=[t[0] for t in self.targets], variable=self.v_target, **self.menu_kw)
+        self.m_target.grid(row=2, column=0, columnspan=3, sticky="we")
 
-        seg_kw = dict(height=34, corner_radius=10, fg_color=CARD_2, unselected_color=CARD_2, unselected_hover_color=LINE,
-                      selected_color=RED, selected_hover_color=RED_HOVER, text_color=TEXT, font=self._font(13))
-        # level meter (mic test) on the left, audio quality preset on the right
-        arow = ctk.CTkFrame(body, fg_color="transparent")
-        arow.grid(row=4, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        # camera
+        self.k_camera = self._tick(p, "Record camera", self.v_camera_on, self._sources_toggled)
+        self.k_camera.configure(state=dev_state)
+        self.k_camera.grid(row=3, column=0, sticky="w", pady=(12, 4))
+        self.s_cam_size = ctk.CTkSegmentedButton(p, values=list(CAMERA_SIZES), variable=self.v_camera_size,
+                                                 width=150, **{**self.seg_kw, "height": 26, "font": self._font(11)})
+        self.s_cam_size.grid(row=3, column=1, sticky="e", padx=(10, 6), pady=(12, 4))
+        self.b_preview = ctk.CTkButton(p, text="Preview", width=64, command=self.toggle_preview, **self.small_kw)
+        self.b_preview.grid(row=3, column=2, sticky="e", pady=(12, 4))
+        self.m_camera = ctk.CTkOptionMenu(p, values=[self.v_camera.get()], variable=self.v_camera,
+                                          command=lambda _v: self._camera_changed(), **self.menu_kw)
+        self.m_camera.grid(row=4, column=0, columnspan=3, sticky="we")
+
+        # audio
+        self.k_audio = self._tick(p, "Record audio", self.v_audio_on, self._sources_toggled)
+        self.k_audio.configure(state=dev_state)
+        self.k_audio.grid(row=5, column=0, sticky="w", pady=(12, 4))
+        self.b_test = ctk.CTkButton(p, text="Test mic", width=70, command=self.test_mic, **self.small_kw)
+        self.b_test.grid(row=5, column=1, sticky="e", padx=(0, 6), pady=(12, 4))
+        self.b_refresh = ctk.CTkButton(p, text="↻", width=30, command=self.refresh_devices, state=dev_state,
+                                       **{**self.small_kw, "font": self._font(14)})
+        self.b_refresh.grid(row=5, column=2, sticky="e", pady=(12, 4))
+        self.m_audio = ctk.CTkOptionMenu(p, values=[self.v_audio.get()], variable=self.v_audio,
+                                         command=lambda _v: self._audio_changed(), **self.menu_kw)
+        self.m_audio.grid(row=6, column=0, columnspan=3, sticky="we")
+
+        arow = ctk.CTkFrame(p, fg_color="transparent")
+        arow.grid(row=7, column=0, columnspan=3, sticky="we", pady=(8, 0))
         arow.columnconfigure(0, weight=1)
         self.p_level = ctk.CTkProgressBar(arow, height=10, corner_radius=5, fg_color=CARD_2, progress_color=GREEN)
         self.p_level.set(0)
         self.p_level.grid(row=0, column=0, sticky="we")
         ctk.CTkLabel(arow, textvariable=self.v_level, font=self._font(11, family="Consolas"), text_color=MUTED,
-                     width=64, anchor="e").grid(row=0, column=1, padx=(8, 10))
+                     width=60, anchor="e").grid(row=0, column=1, padx=(8, 8))
         self.s_audio_q = ctk.CTkSegmentedButton(arow, values=list(AUDIO_PRESETS), variable=self.v_audio_quality,
-                                                width=150, **{**seg_kw, "height": 28, "font": self._font(12)})
+                                                width=130, **{**self.seg_kw, "height": 26, "font": self._font(11)})
         self.s_audio_q.grid(row=0, column=2, sticky="e")
 
-        # mic boost slider + auto level switch
-        grow = ctk.CTkFrame(body, fg_color="transparent")
-        grow.grid(row=5, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        grow = ctk.CTkFrame(p, fg_color="transparent")
+        grow.grid(row=8, column=0, columnspan=3, sticky="we", pady=(8, 0))
         grow.columnconfigure(1, weight=1)
         ctk.CTkLabel(grow, text="MIC BOOST", font=self._font(11, "bold"), text_color=MUTED, anchor="w").grid(
-            row=0, column=0, padx=(0, 10))
+            row=0, column=0, padx=(0, 8))
         self.sl_gain = ctk.CTkSlider(grow, from_=0, to=MIC_GAIN_MAX, number_of_steps=MIC_GAIN_MAX, variable=self.v_gain,
                                      height=16, fg_color=CARD_2, progress_color=RED, button_color=TEXT,
                                      button_hover_color="#ffffff", command=lambda _v: self._gain_text())
         self.sl_gain.grid(row=0, column=1, sticky="we")
         self.sl_gain.bind("<ButtonRelease-1>", lambda _e: self._audio_changed())
         ctk.CTkLabel(grow, textvariable=self.v_gain_text, font=self._font(11, family="Consolas"), text_color=TEXT,
-                     width=52, anchor="e").grid(row=0, column=2, padx=(8, 10))
+                     width=50, anchor="e").grid(row=0, column=2, padx=(6, 8))
         self.sw_auto = ctk.CTkSwitch(grow, text="Auto level", variable=self.v_auto_level, progress_color=RED,
-                                     font=self._font(12), text_color=TEXT, width=100, command=self._audio_changed)
+                                     font=self._font(12), text_color=TEXT, width=96, command=self._audio_changed)
         self.sw_auto.grid(row=0, column=3, sticky="e")
         self._gain_text()
-        self._audio_toggled()
+        self._sources_toggled()
 
-        self._section(body, "Frame rate", 6, columnspan=1)
-        self._section(body, "Quality", 6, column=1, columnspan=2)
-        self.s_fps = ctk.CTkSegmentedButton(body, values=[str(x) for x in FPS_CHOICES], variable=self.v_fps, **seg_kw)
-        self.s_fps.grid(row=7, column=0, sticky="we", padx=(0, 8))
-        self.s_quality = ctk.CTkSegmentedButton(body, values=list(QUALITY_PRESETS), variable=self.v_quality, **seg_kw)
-        self.s_quality.grid(row=7, column=1, columnspan=2, sticky="we")
+    def _build_output(self, p) -> None:
+        ctk = self.ctk
+        p.columnconfigure(0, weight=1)
+        p.columnconfigure(1, weight=1)
 
-        self._section(body, "Save to", 8)
-        self.e_out = ctk.CTkEntry(body, textvariable=self.v_out, height=36, corner_radius=10, fg_color=CARD_2,
+        self._label(p, "Frame rate", row=1, column=0, pady=(8, 4))
+        self._label(p, "Quality", row=1, column=1, pady=(8, 4), padx=(8, 0))
+        self.s_fps = ctk.CTkSegmentedButton(p, values=[str(x) for x in FPS_CHOICES], variable=self.v_fps, **self.seg_kw)
+        self.s_fps.grid(row=2, column=0, sticky="we")
+        self.s_quality = ctk.CTkSegmentedButton(p, values=list(QUALITY_PRESETS), variable=self.v_quality, **self.seg_kw)
+        self.s_quality.grid(row=2, column=1, sticky="we", padx=(8, 0))
+
+        self._label(p, "Save to", row=3, column=0, columnspan=2, pady=(12, 4))
+        srow = ctk.CTkFrame(p, fg_color="transparent")
+        srow.grid(row=4, column=0, columnspan=2, sticky="we")
+        srow.columnconfigure(0, weight=1)
+        self.e_out = ctk.CTkEntry(srow, textvariable=self.v_out, height=34, corner_radius=10, fg_color=CARD_2,
                                   border_color=LINE, text_color=TEXT, font=self._font(13))
-        self.e_out.grid(row=9, column=0, columnspan=2, sticky="we", padx=(0, 8))
-        self.b_browse = ctk.CTkButton(body, text="Browse", width=84, height=36, corner_radius=10, fg_color=CARD_2,
+        self.e_out.grid(row=0, column=0, sticky="we", padx=(0, 8))
+        self.b_browse = ctk.CTkButton(srow, text="Browse", width=80, height=34, corner_radius=10, fg_color=CARD_2,
                                       hover_color=LINE, text_color=TEXT, font=self._font(13), command=self.browse)
-        self.b_browse.grid(row=9, column=2, sticky="e")
+        self.b_browse.grid(row=0, column=1)
 
-        self.sw_min = ctk.CTkSwitch(body, text="Minimise window while recording", variable=self.v_minimize,
+        self.sw_min = ctk.CTkSwitch(p, text="Minimise window while recording", variable=self.v_minimize,
                                     progress_color=RED, font=self._font(13), text_color=TEXT)
-        self.sw_min.grid(row=10, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        self.sw_min.grid(row=5, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
-        # actions
-        self.b_toggle = ctk.CTkButton(f, text="●   Start recording", height=50, corner_radius=14, fg_color=RED,
+        self.b_toggle = ctk.CTkButton(p, text="●   Start recording", height=48, corner_radius=14, fg_color=RED,
                                       hover_color=RED_HOVER, text_color="white", font=self._font(15, "bold"),
                                       command=self.toggle)
-        self.b_toggle.grid(row=4, column=0, sticky="we", pady=(18, 8))
-        row = ctk.CTkFrame(f, fg_color="transparent")
-        row.grid(row=5, column=0, sticky="we")
-        row.columnconfigure(2, weight=1)
-        btn_kw = dict(height=34, corner_radius=10, fg_color=CARD_2, hover_color=LINE, text_color=TEXT, font=self._font(13))
-        ctk.CTkButton(row, text="Open folder", width=110, command=self.open_folder, **btn_kw).grid(row=0, column=0)
-        self.b_play = ctk.CTkButton(row, text="▶  Play last", width=110, command=self.play_last, state="disabled", **btn_kw)
+        self.b_toggle.grid(row=6, column=0, columnspan=2, sticky="we", pady=(18, 8))
+        brow = ctk.CTkFrame(p, fg_color="transparent")
+        brow.grid(row=7, column=0, columnspan=2, sticky="we")
+        brow.columnconfigure(2, weight=1)
+        btn_kw = dict(height=32, corner_radius=10, fg_color=CARD_2, hover_color=LINE, text_color=TEXT, font=self._font(12))
+        ctk.CTkButton(brow, text="Open folder", width=100, command=self.open_folder, **btn_kw).grid(row=0, column=0)
+        self.b_play = ctk.CTkButton(brow, text="▶  Play last", width=100, command=self.play_last, state="disabled", **btn_kw)
         self.b_play.grid(row=0, column=1, padx=(8, 0))
-        self.l_hotkey = ctk.CTkLabel(row, text="", font=self._font(12), text_color=MUTED, anchor="e",
-                                     justify="right", wraplength=150)
+        self.l_hotkey = ctk.CTkLabel(brow, text="", font=self._font(11), text_color=MUTED, anchor="e",
+                                     justify="right", wraplength=130)
         self.l_hotkey.grid(row=0, column=2, sticky="e")
 
-        # footer
-        ctk.CTkLabel(f, textvariable=self.v_last, font=self._font(12), text_color=MUTED, anchor="w",
-                     wraplength=410, justify="left").grid(row=6, column=0, sticky="w", pady=(14, 0))
-        ctk.CTkLabel(f, text=f"Engine  {self.engine.name}", font=self._font(11), text_color=DIM, anchor="w").grid(
-            row=7, column=0, sticky="w", pady=(4, 0))
+        ctk.CTkLabel(p, textvariable=self.v_last, font=self._font(12), text_color=MUTED, anchor="w",
+                     wraplength=330, justify="left").grid(row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        ctk.CTkLabel(p, text=f"Engine  {self.engine.name}", font=self._font(10), text_color=DIM, anchor="w",
+                     wraplength=330, justify="left").grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-    # -- audio devices --------------------------------------------------
-    def _detect_audio(self) -> None:
-        self.audio_devices = list_audio_devices(self.ffmpeg)
-        self.events.put("audio")
+    # -- devices --------------------------------------------------------
+    def _detect_devices(self) -> None:
+        self.audio_devices, self.cameras = list_dshow_devices(self.ffmpeg)
+        self.events.put("devices")
 
-    def refresh_audio(self) -> None:
-        if self.busy or self.recording or not self.engine.supports_audio:
+    def refresh_devices(self) -> None:
+        if self.busy or self.recording or not self.devices_ok:
             return
         self.wanted_audio = self.v_audio.get()
+        self.wanted_camera = self.v_camera.get()
         self.v_audio.set(DETECTING)
-        threading.Thread(target=self._detect_audio, daemon=True).start()
+        self.v_camera.set(DETECTING)
+        threading.Thread(target=self._detect_devices, daemon=True).start()
 
-    def _apply_audio_list(self) -> None:
-        if self.audio_devices:
-            self.m_audio.configure(values=[d.name for d in self.audio_devices])
-            chosen = find_audio_device(self.audio_devices, self.wanted_audio) or self.audio_devices[0]
-            self.v_audio.set(chosen.name)
-            self.k_audio.configure(state="normal")
-        else:
-            self.m_audio.configure(values=["No input devices found"])
-            self.v_audio.set("No input devices found")
-            self.v_audio_on.set(False)
-            self.k_audio.configure(state="disabled")
-        self._audio_toggled()
+    def _apply_device_lists(self) -> None:
+        for devices, menu, var, wanted, tick_var in (
+            (self.audio_devices, self.m_audio, self.v_audio, self.wanted_audio, self.v_audio_on),
+            (self.cameras, self.m_camera, self.v_camera, self.wanted_camera, self.v_camera_on),
+        ):
+            if devices:
+                menu.configure(values=[d.name for d in devices])
+                var.set((find_device(devices, wanted) or devices[0]).name)
+            else:
+                menu.configure(values=[NONE_FOUND])
+                var.set(NONE_FOUND)
+                tick_var.set(False)
+        self._sources_toggled()
 
-    def _audio_toggled(self) -> None:
-        """Tick box drives the device controls: greyed out unless audio is wanted."""
-        on = self.v_audio_on.get() and bool(self.audio_devices)
-        state = "normal" if on else "disabled"
-        for w in (self.m_audio, self.b_test, self.s_audio_q, self.sl_gain, self.sw_auto):
-            w.configure(state=state)
-        self.k_audio.configure(text_color=TEXT if self.v_audio_on.get() else MUTED)
-        if not on:
-            self._stop_meter()
-
-    def _selected_audio(self) -> AudioDevice | None:
-        if not self.v_audio_on.get():
+    def _selected_audio(self) -> AudioSettings | None:
+        device = find_device(self.audio_devices, self.v_audio.get()) if self.v_audio_on.get() else None
+        if device is None:
             return None
-        return find_audio_device(self.audio_devices, self.v_audio.get())
+        return AudioSettings(device, self.v_audio_quality.get(), float(self.v_gain.get()), bool(self.v_auto_level.get()))
+
+    def _selected_camera(self) -> CameraSettings | None:
+        device = find_device(self.cameras, self.v_camera.get()) if self.v_camera_on.get() else None
+        return CameraSettings(device, self.v_camera_size.get()) if device else None
+
+    def _sources_toggled(self) -> None:
+        """Each tick box drives its own controls: greyed out unless that source is wanted."""
+        self.m_target.configure(state="normal" if self.v_desktop_on.get() else "disabled")
+        self.k_desktop.configure(text_color=TEXT if self.v_desktop_on.get() else MUTED)
+
+        cam = self.v_camera_on.get() and bool(self.cameras)
+        for w in (self.m_camera, self.s_cam_size, self.b_preview):
+            w.configure(state="normal" if cam else "disabled")
+        self.k_camera.configure(state="normal" if self.cameras else "disabled",
+                                text_color=TEXT if self.v_camera_on.get() else MUTED)
+        # the PiP size only matters when there is a desktop to draw it on
+        if cam and not self.v_desktop_on.get():
+            self.s_cam_size.configure(state="disabled")
+        if not cam:
+            self._stop_preview()
+
+        aud = self.v_audio_on.get() and bool(self.audio_devices)
+        for w in (self.m_audio, self.b_test, self.s_audio_q, self.sl_gain, self.sw_auto):
+            w.configure(state="normal" if aud else "disabled")
+        self.k_audio.configure(state="normal" if self.audio_devices else "disabled",
+                               text_color=TEXT if self.v_audio_on.get() else MUTED)
+        if not aud:
+            self._stop_meter()
 
     # -- mic test -------------------------------------------------------
     def test_mic(self) -> None:
         if self.meter is not None:
             self._stop_meter()
             return
-        audio = self._audio_settings()
+        audio = self._selected_audio()
         if audio is None or self.recording or self.busy:
             return
         self.meter = MicMeter(self.ffmpeg, audio)
@@ -728,12 +911,6 @@ class RecorderApp:
     def _gain_text(self) -> None:
         self.v_gain_text.set(f"+{self.v_gain.get():.0f} dB")
 
-    def _audio_settings(self) -> AudioSettings | None:
-        device = self._selected_audio()
-        if device is None:
-            return None
-        return AudioSettings(device, self.v_audio_quality.get(), float(self.v_gain.get()), bool(self.v_auto_level.get()))
-
     def _tick_meter(self) -> None:
         m = self.meter
         if m is None:
@@ -749,28 +926,76 @@ class RecorderApp:
         self.p_level.configure(progress_color=RED if db > -3 else AMBER if db > -12 else GREEN)
         self.v_level.set(f"{db:5.1f} dB" if db > MicMeter.SILENCE_DB else "silent")
 
+    # -- camera preview -------------------------------------------------
+    def toggle_preview(self) -> None:
+        if self.preview is not None:
+            self._stop_preview()
+            return
+        cam = self._selected_camera()
+        if cam is None or self.recording or self.busy:
+            return
+        self.preview = CameraPreview(self.ffmpeg, cam.device)
+        try:
+            self.preview.start()
+        except Exception as e:
+            self.preview = None
+            self._error(str(e))
+            return
+        self.b_preview.configure(text="Close", text_color=TEXT)
+
+    def _stop_preview(self) -> None:
+        if self.preview is None:
+            return
+        self.preview.stop()
+        self.preview = None
+        self.b_preview.configure(text="Preview", text_color=MUTED)
+
+    def _camera_changed(self) -> None:
+        if self.preview is not None:
+            self._stop_preview()
+            self.toggle_preview()
+
+    def _tick_preview(self) -> None:
+        p = self.preview
+        if p is not None and not p.alive():      # user closed the window, or the camera failed
+            err = p.error()
+            self._stop_preview()
+            if err:
+                self._error(f"Camera preview failed:\n{err}")
+
     # -- helpers --------------------------------------------------------
+    def _job(self, out_dir: Path) -> RecordJob:
+        audio = self._selected_audio()
+        camera = self._selected_camera()
+        desktop = bool(self.v_desktop_on.get())
+        ext = ".mp4" if (desktop or camera) else ".m4a"
+        return RecordJob(new_output_path(out_dir, ext), int(self.v_fps.get()), self.v_quality.get(), desktop,
+                         dict(self.targets)[self.v_target.get()], camera, audio)
+
     def _refresh_summary(self) -> None:
+        parts = []
+        if self.v_desktop_on.get():
+            parts.append(self.v_target.get())
+        if self.v_camera_on.get():
+            parts.append(f"camera {self.v_camera.get()}" + (f" ({self.v_camera_size.get()} PiP)" if self.v_desktop_on.get() else ""))
         if self.v_audio_on.get():
-            a = self._audio_settings()
-            audio = self.v_audio.get() + (f"  ({a.label})" if a else "")
-        else:
-            audio = "no audio"
-        self.v_summary.set(f"{self.v_target.get()}  ·  {self.v_fps.get()} fps  ·  {self.v_quality.get()}  ·  {audio}")
+            a = self._selected_audio()
+            parts.append(self.v_audio.get() + (f" ({a.label})" if a else ""))
+        parts.append(f"{self.v_fps.get()} fps  ·  {self.v_quality.get()}")
+        self.v_summary.set("  ·  ".join(parts) if len(parts) > 1 else "Nothing selected -- tick a source")
 
     def _set_inputs(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for w in (self.m_target, self.s_fps, self.s_quality, self.e_out, self.b_browse, self.sw_min):
+        for w in (self.s_fps, self.s_quality, self.e_out, self.b_browse, self.sw_min, self.b_refresh, self.k_desktop):
             w.configure(state=state)
-        if self.engine.supports_audio:
-            self.b_refresh.configure(state=state)
-            if enabled:
-                self.k_audio.configure(state="normal" if self.audio_devices else "disabled")
-                self._audio_toggled()
-            else:
-                self._stop_meter()
-                for w in (self.k_audio, self.m_audio, self.b_test, self.s_audio_q, self.sl_gain, self.sw_auto):
-                    w.configure(state="disabled")
+        if enabled:
+            self._sources_toggled()
+        else:
+            self._stop_meter()
+            self._stop_preview()
+            for w in (self.m_target, self.k_camera, self.m_camera, self.s_cam_size, self.b_preview,
+                      self.k_audio, self.m_audio, self.b_test, self.s_audio_q, self.sl_gain, self.sw_auto):
+                w.configure(state="disabled")
 
     def _error(self, text: str) -> None:
         from tkinter import messagebox
@@ -798,26 +1023,27 @@ class RecorderApp:
         self.stop() if self.recording else self.start()
 
     def start(self) -> None:
-        if self.v_audio_on.get() and self.v_audio.get() == DETECTING:
-            self._error("Still detecting audio devices, try again in a second (or untick Record audio).")
+        if not (self.v_desktop_on.get() or self.v_camera_on.get() or self.v_audio_on.get()):
+            self._error("Nothing selected to record.\n\nTick at least one of desktop, camera or audio.")
+            return
+        if DETECTING in (self.v_audio.get(), self.v_camera.get()) and (self.v_audio_on.get() or self.v_camera_on.get()):
+            self._error("Still detecting devices, try again in a second.")
             return
         self.busy = True
-        self._set_inputs(False)
+        self._set_inputs(False)     # also closes the mic test and camera preview (the camera can't be shared)
         self.b_toggle.configure(state="disabled", text="Starting…")
         self.v_status.set("Starting…")
         delay = 0
-        if self.v_minimize.get():
+        if self.v_minimize.get() and self.v_desktop_on.get():
             self.root.iconify()
             delay = START_DELAY_MS   # so the minimise animation is not in the clip
         self.root.after(delay, self._start_engine)
 
     def _start_engine(self) -> None:
         out_dir = Path(self.v_out.get().strip() or DEFAULT_OUT_DIR)
-        region = dict(self.targets)[self.v_target.get()]
-        audio = self._audio_settings()
         try:
-            path = new_output_path(out_dir)
-            self.engine.start(path, int(self.v_fps.get()), self.v_quality.get(), region, audio)
+            job = self._job(out_dir)
+            self.engine.start(job)
         except Exception as e:
             self.busy = False
             self._set_inputs(True)
@@ -827,18 +1053,23 @@ class RecorderApp:
                 self.root.deiconify()
             self._error(str(e))
             return
-        save_settings({"fps": int(self.v_fps.get()), "quality": self.v_quality.get(), "out_dir": str(out_dir),
-                       "minimize": bool(self.v_minimize.get()), "audio_on": bool(self.v_audio_on.get()),
-                       "audio_quality": self.v_audio_quality.get(), "mic_gain": float(self.v_gain.get()),
-                       "auto_level": bool(self.v_auto_level.get()),
-                       # keep the device choice even when unticked, so re-ticking brings it back
-                       "audio": self.v_audio.get() if self.audio_devices else "default"})
+        save_settings({
+            "desktop_on": bool(self.v_desktop_on.get()), "target": self.v_target.get(),
+            "camera_on": bool(self.v_camera_on.get()), "camera_size": self.v_camera_size.get(),
+            "camera": self.v_camera.get() if self.cameras else "default",
+            "audio_on": bool(self.v_audio_on.get()), "audio_quality": self.v_audio_quality.get(),
+            "mic_gain": float(self.v_gain.get()), "auto_level": bool(self.v_auto_level.get()),
+            # keep the device choices even when unticked, so re-ticking brings them back
+            "audio": self.v_audio.get() if self.audio_devices else "default",
+            "fps": int(self.v_fps.get()), "quality": self.v_quality.get(), "out_dir": str(out_dir),
+            "minimize": bool(self.v_minimize.get()),
+        })
         self.busy = False
         self.recording = True
         self.started_at = time.monotonic()
         self.v_status.set("Recording")
         self.l_dot.configure(text_color=RED)
-        self.v_last.set(f"Writing {path.name}")
+        self.v_last.set(f"Writing {job.path.name}")
         self.b_toggle.configure(state="normal", text="■   Stop recording", fg_color=CARD_2, hover_color=LINE)
 
     def stop(self) -> None:
@@ -884,12 +1115,13 @@ class RecorderApp:
                 break
             if ev == "toggle":
                 self.toggle()
-            elif ev == "audio":
-                self._apply_audio_list()
+            elif ev == "devices":
+                self._apply_device_lists()
             else:
                 self._on_stopped(ev)
         self._tick_meter()
-        self.ticks = getattr(self, "ticks", 0) + 1
+        self._tick_preview()
+        self.ticks += 1
         if self.recording:
             secs = int(time.monotonic() - self.started_at)
             self.v_clock.set(f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}")
@@ -903,6 +1135,7 @@ class RecorderApp:
 
     def on_close(self) -> None:
         self._stop_meter()
+        self._stop_preview()
         if self.recording:
             try:
                 self.engine.stop()
@@ -941,26 +1174,33 @@ def run_cli(args: argparse.Namespace) -> int:
     label, region = targets[args.monitor]
 
     audio: AudioSettings | None = None
-    if args.audio:
-        if not engine.supports_audio:
-            print("Audio needs ffmpeg on PATH (winget install Gyan.FFmpeg); recording video only.", file=sys.stderr)
+    camera: CameraSettings | None = None
+    if args.audio or args.camera:
+        if not engine.supports_devices:
+            print("Camera and audio need ffmpeg on PATH (winget install Gyan.FFmpeg); recording the desktop only.",
+                  file=sys.stderr)
         else:
-            devices = list_audio_devices(engine.ffmpeg)
-            device = find_audio_device(devices, args.audio)
-            if device is None:
-                print(f"No audio input matches '{args.audio}'.  Available:", file=sys.stderr)
-                for d in devices:
-                    print(f"  {d.name}", file=sys.stderr)
-                return 2
-            audio = AudioSettings(device, args.audio_quality, args.mic_gain, not args.no_auto_level)
+            audio_devices, cameras = list_dshow_devices(engine.ffmpeg)
+            for wanted, devices, what in ((args.audio, audio_devices, "audio input"), (args.camera, cameras, "camera")):
+                if wanted and find_device(devices, wanted) is None:
+                    print(f"No {what} matches '{wanted}'.  Available:", file=sys.stderr)
+                    for d in devices:
+                        print(f"  {d.name}", file=sys.stderr)
+                    return 2
+            if args.audio:
+                audio = AudioSettings(find_device(audio_devices, args.audio), args.audio_quality, args.mic_gain,
+                                      not args.no_auto_level)
+            if args.camera:
+                camera = CameraSettings(find_device(cameras, args.camera), args.camera_size)
 
-    path = new_output_path(Path(args.out))
+    desktop = not args.no_desktop
+    ext = ".mp4" if (desktop or camera) else ".m4a"
+    job = RecordJob(new_output_path(Path(args.out), ext), args.fps, args.quality, desktop, region, camera, audio)
     print(f"{APP_NAME}  --  {engine.name}")
-    print(f"Capturing {label} at {args.fps} fps, quality {args.quality}, "
-          f"audio: {audio.device.name + ' (' + audio.label + ')' if audio else 'none'}")
-    print(f"Writing   {path}")
+    print(f"Recording {job.describe()}" + (f" [{label}]" if desktop else "") + f" at {args.fps} fps, quality {args.quality}")
+    print(f"Writing   {job.path}")
     try:
-        engine.start(path, args.fps, args.quality, region, audio)
+        engine.start(job)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
@@ -988,7 +1228,11 @@ def run_cli(args: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=APP_NAME)
     p.add_argument("--cli", action="store_true", help="record from the terminal instead of the GUI")
-    p.add_argument("--list-audio", action="store_true", help="list audio input devices and exit")
+    p.add_argument("--list-devices", "--list-audio", action="store_true", help="list cameras and audio inputs, then exit")
+    p.add_argument("--no-desktop", action="store_true", help="leave the desktop out (camera and/or audio only)")
+    p.add_argument("--camera", metavar="NAME", help="webcam: 'default' (first camera) or part of its name")
+    p.add_argument("--camera-size", default="Small", choices=list(CAMERA_SIZES),
+                   help="picture-in-picture size when drawn over the desktop")
     p.add_argument("--audio", metavar="NAME", help="audio input: 'default' (first device) or part of its name")
     p.add_argument("--audio-quality", default="Standard", choices=list(AUDIO_PRESETS),
                    help="Standard = AAC 160k/44.1kHz, High = AAC 320k/48kHz")
@@ -999,14 +1243,15 @@ def main() -> int:
     p.add_argument("--fps", type=int, default=30, choices=FPS_CHOICES)
     p.add_argument("--quality", default="Balanced", choices=list(QUALITY_PRESETS))
     p.add_argument("--monitor", type=int, default=0, help="0 = full desktop, 1.. = that monitor")
-    p.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="folder for the MP4 files")
+    p.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="folder for the recordings")
     p.add_argument("--duration", type=float, default=0, help="seconds to record (CLI only; 0 = until stopped)")
     args = p.parse_args()
 
     _make_dpi_aware()
-    if args.list_audio:
-        devices = list_audio_devices(shutil.which("ffmpeg"))
-        print("\n".join(d.name for d in devices) if devices else "No audio input devices found (is ffmpeg on PATH?)")
+    if args.list_devices:
+        audio, cameras = list_dshow_devices(shutil.which("ffmpeg"))
+        print("Cameras:\n" + ("\n".join(f"  {d.name}" for d in cameras) or "  (none)"))
+        print("Audio inputs:\n" + ("\n".join(f"  {d.name}" for d in audio) or "  (none -- is ffmpeg on PATH?)"))
         return 0
     if args.cli:
         return run_cli(args)
