@@ -28,13 +28,16 @@ Make a desktop shortcut to the `.bat` if you want it one click away.
 | Audio input | Any DirectShow input device (mic, USB audio, Stereo Mix). `↻` re-scans after plugging in a mic. |
 | **Test mic** | Live level meter for the chosen device -- speak and watch the bar (green / amber / red near clipping). Click again to stop; it stops by itself when a recording starts. |
 | Audio quality | `Standard` = AAC 160 kb/s, 44.1 kHz. `High` = AAC 320 kb/s, 48 kHz. |
+| **Mic boost** | 0 to +30 dB gain on the mic (default +20 dB -- USB mics on Windows usually come in far too quiet). The Test-mic bar shows the boosted level, so speak and drag until normal speech sits in the green/amber. |
+| Auto level | On (default): the boost is the *maximum* -- quiet speech is lifted by up to that much and loud parts are pulled down, so the level stays even. Off: a plain fixed gain. A limiter stops clipping either way. |
 | Frame rate | 15 / 24 / 30 / 60. 30 is the sensible default. |
 | Quality | `Small file` (crf 28), `Balanced` (crf 23), `High` (crf 18, bigger file). |
 | Save to | Folder for the clips. Default `%USERPROFILE%\Videos\sbmlabs_screen_recorder`. |
 | Open folder / Play last | Opens the folder in Explorer / plays the clip you just made. |
 
 Files are named `sbmlabs_rec_YYYYMMDD_HHMMSS.mp4`. FPS, quality, folder, the audio
-tick, device, audio quality and the minimise choice are remembered in
+tick, device, audio quality, mic boost, auto level and the minimise choice are
+remembered in
 `%LOCALAPPDATA%\sbmlabs_screen_recorder\settings.json`.
 
 ## CLI
@@ -45,6 +48,8 @@ python recorder.py --cli                                    # video only, until 
 python recorder.py --cli --audio default                    # + first microphone found
 python recorder.py --cli --audio "USB PnP" --duration 60    # device by (part of) its name, 60 s
 python recorder.py --cli --audio default --audio-quality High   # AAC 320k / 48 kHz
+python recorder.py --cli --audio default --mic-gain 25           # boost (default 20 dB)
+python recorder.py --cli --audio default --no-auto-level         # fixed gain instead of adaptive
 python recorder.py --cli --fps 60 --quality High --out D:\clips
 python recorder.py --cli --monitor 1                        # 0 = full desktop, 1.. = that monitor
 ```
@@ -66,6 +71,10 @@ Only `customtkinter` is needed for the GUI; the CLI is pure standard library
 
 ## Notes
 
+* **Still too quiet?** Raise the mic in Windows too: Settings -> System -> Sound ->
+  Input -> your microphone -> *Input volume* to 100, and in the device's
+  *Additional device properties* enable *Microphone Boost* if it has one. The
+  app's boost stacks on top of that.
 * To record **what you hear** (system audio), enable *Stereo Mix* in Windows
   Sound settings -> Recording; it then shows up as an audio input here.
 * If the status line says the hotkey *is taken by another app*, some other
